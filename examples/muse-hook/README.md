@@ -17,7 +17,7 @@
              有新消息 │  先落盘，再 wake
                       ▼
         ilink-pending.json          ← 待处理队列（原子写入，断电不丢）
-                      │  worker 用 mv 原子认领 → ilink-processing.json
+                      │  worker 用 ilink.py claim 认领 → ilink-processing.json
                       ▼
               Muse worker agent     ← 发送前复查队列、合并连发，只回一条；
                                       超过 10 分钟没处理完的批次会被
@@ -28,8 +28,12 @@
 
 - **不丢消息**：hook 脚本先把消息落盘再唤醒 agent。agent 崩溃/超时，
   消息还在队列里，下一轮脚本会再次唤醒。
-- **不重复回复**：认领用 `mv`（原子操作），多个重复唤醒里只有一个
-  能拿到队列，其余安静退出。认领后立即 `touch` processing 文件、
+- **不重复回复**：认领用 `ilink.py claim`（队列锁内完成；已有
+  processing 时拒绝认领，绝不像裸 `mv` 那样覆盖别人的批次），多个重复
+  唤醒里只有一个能拿到队列，其余安静退出。已有 worker 持有新鲜认领时，
+  脚本不再为新消息另起 worker，新消息由它发送前的
+  `ilink.py claim --merge <claim_id>` 合并进同一条回复；回复后用
+  `ilink.py release <claim_id>` 释放（认领已被回收时拒绝删除别人的批次）。认领后立即 `touch` processing 文件、
   处理期间约每 60 秒再 touch 一次续租：脚本按文件 ctime 超 10 分钟
   回收，活着但慢的 worker 停 touch 也会被误判死亡、批次被重新唤醒
   导致双 worker 各回一遍。
@@ -61,8 +65,10 @@
 - **交付语义：至少一次（at-least-once）**。poll 是两段式的：`ilink.py
   poll` 只拉取、不推进游标不记去重 ID；脚本把批次原子落盘后才调
   `ilink.py commit` 提交。任何一步崩溃，消息都会在下一轮被重新拉到
-  ——可能重复回复，但绝不静默丢失。配套的防线：超时回收只在待处理
-  队列为空时进行（不会覆盖新批次）；poll 输出为空/非法 JSON 一律按
+  ——可能重复回复，但绝不静默丢失。配套的防线：超时回收会把卡住的
+  批次合并到新批次前面（两边都不覆盖）；单轮媒体下载有总预算
+  （`ILINK_POLL_MEDIA_BUDGET`，默认 60 秒），超出的附件带 `media_error`
+  照常投递，不会拖过 poll 超时变成反复重拉的毒批次；poll 输出为空/非法 JSON 一律按
   轮询故障处理（进程硬崩溃也会进告警状态机，而不是被当成"没有新
   消息"）。
 

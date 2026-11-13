@@ -212,18 +212,21 @@ def acquire_driver_lock_or_exit():
             return None
 
 
-def poll_once():
+def poll_once(cursor=None):
     """One long-poll. Returns (status, msgs, commit).
 
     The commit block is NOT submitted here. The caller hands the batch
     to the handler first and commits only after handling succeeds
     (handle-then-commit — see the module docstring for the semantics).
     A poll that fails or expires carries commit=None.
+
+    cursor (optional) continues from an uncommitted earlier poll — see
+    collect_burst; None reads the committed cursor from session.json.
     """
-    r = subprocess.run(
-        [sys.executable, os.path.join(HERE, "ilink.py"), "poll"],
-        capture_output=True, text=True, timeout=180,
-    )
+    args = [sys.executable, os.path.join(HERE, "ilink.py"), "poll"]
+    if cursor:
+        args += ["--cursor", cursor]
+    r = subprocess.run(args, capture_output=True, text=True, timeout=180)
     out = (r.stdout or "").strip()
     if out.startswith("NO_TOKEN") or out.startswith("TOKEN_EXPIRED"):
         return "expired", [], None
@@ -308,9 +311,20 @@ def collect_burst(first_msgs, first_commits):
 
     msgs = _fresh(first_msgs)
     commits = list(first_commits)
+
+    def _cursor():
+        # Continue from the newest uncommitted poll: re-polling from the
+        # committed cursor made the server replay the same batch at once
+        # (no long-poll hold), so the merge window spun hot and every
+        # round re-downloaded the batch's media.
+        for c in reversed(commits):
+            if isinstance(c, dict) and c.get("cursor"):
+                return c["cursor"]
+        return None
+
     deadline = time.time() + MERGE_WINDOW
     while time.time() < deadline:
-        status, more, commit = poll_once()
+        status, more, commit = poll_once(_cursor())
         if status == "ok" and more:
             fresh = _fresh(more)
             msgs.extend(fresh)

@@ -70,17 +70,29 @@ inside a WeChat conversation itself.
 **If you run inside Muse with its hook runtime available** (production
 setup): wire `examples/muse-hook/ilink-watch.sh` as a hook that runs every
 ~5 seconds. Read `examples/muse-hook/README.md` first — the script persists
-each batch to a pending queue before waking you, and you claim it with an
-atomic `mv`. When woken, handle the batch under this contract:
+each batch to a pending queue before waking you, and you claim it with
+`ilink.py claim`. When woken, handle the batch under this contract:
 
 - Reply only to the owner. Enforcement is in code, not on you: `poll`
   only queues senders allowlisted in `owner.json` (`owner_ids`), so any
   batch you are woken with is already the owner's (possibly from one of
   several accounts of the same human).
-- After claiming with `mv`, immediately `touch` the processing file:
-  crash recovery judges staleness by file timestamps, and `mv` preserves
-  the message-arrival time — an un-refreshed claim can be mistaken for a
-  stale one and bounced back to pending. Keep renewing the lease while
+- Claim, merge and release through `ilink.py`, never with a bare `mv`
+  (a bare `mv` silently replaces another worker's processing file):
+  - `ilink.py claim` → `CLAIMED:<claim_id>:<count>` plus
+    `PROCESSING_FILE:<path>`: the batch is yours; keep the claim_id.
+    `CLAIM_BUSY` / `CLAIM_EMPTY` (exit 3) means another worker already
+    holds a batch (it will merge the new messages itself) or there is
+    nothing to do — end the turn quietly.
+  - Pre-send re-check: `ilink.py claim --merge <claim_id>` →
+    `MERGED:<new>:<total>` (re-read the processing file and re-compose),
+    `MERGE_NOTHING` (send now), or `MERGE_NOT_OWNER` (exit 3: your claim
+    was recycled and another worker owns the batch — do NOT send; end
+    the turn).
+  - After the last bubble went out: `ilink.py release <claim_id>`.
+- After claiming, `touch` the processing file right away: crash recovery
+  judges staleness by file timestamps — an un-refreshed claim can be
+  mistaken for a stale one and bounced back to pending. Keep renewing the lease while
   you work the batch: `touch` the processing file at least about every
   60 seconds during long reads, long generations and pre-send rechecks
   — the hook recycles a claim whose ctime is over 10 minutes old, and a
@@ -88,9 +100,12 @@ atomic `mv`. When woken, handle the batch under this contract:
   one, so the batch would be re-queued and a second worker could reply
   to it too. The first touch is mandatory; the periodic ones are what
   keep a slow turn from being recycled.
-- One composed response per burst: before sending, re-check the
-  pending file; if newer messages arrived while you composed, merge
-  them and re-compose against the newest context (max 3 rounds).
+- One composed response per burst: before sending, run
+  `ilink.py claim --merge <claim_id>`; if newer messages arrived while
+  you composed, it folds them into your processing file — re-compose
+  against the newest context (max 3 rounds). While your claim is fresh
+  the hook does not wake another worker for newer messages; they wait
+  for this merge (or for your warm wait).
   Delivery may split into 2–3 short bubbles sent back-to-back when
   the content naturally segments (a reaction, the substance, a
   question) — like a human texting — but never one reply per incoming
@@ -175,7 +190,7 @@ atomic `mv`. When woken, handle the batch under this contract:
   `examples/muse-hook/ilink-warm-wait.sh` instead of ending the turn. It
   maintains the warm marker the watch script checks (while its heartbeat
   is fresh the script will not wake a second worker) and prints one
-  line: on `NEW_MESSAGES`, loop back and claim the new batch WITHOUT
+  line: on `NEW_MESSAGES`, loop back and `ilink.py claim` the new batch WITHOUT
   re-reading the memory/context files — your context is already current
   (still re-check pending before sending and log the exchange as usual,
   then wait again). On `IDLE_TIMEOUT` (default 180 quiet seconds) or

@@ -76,7 +76,7 @@ class ReviewFixesTest(unittest.TestCase):
         ilink.load_contacts = lambda: {}
         ilink.save_contacts = lambda c: None
         ilink.load_owner_ids = lambda: {"u1"}  # sender is the owner here
-        ilink.download_media_item = lambda item, t: (_ for _ in ()).throw(
+        ilink.download_media_item = lambda item, t, **k: (_ for _ in ()).throw(
             RuntimeError("boom"))
         try:
             out = io.StringIO()
@@ -108,7 +108,7 @@ class ReviewFixesTest(unittest.TestCase):
         ilink.load_contacts = lambda: {}
         ilink.save_contacts = lambda c: None
         ilink.load_owner_ids = lambda: {"u1"}  # sender is the owner here
-        ilink.download_media_item = lambda item, t: None
+        ilink.download_media_item = lambda item, t, **k: None
         try:
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
