@@ -19,7 +19,7 @@ WeChat user ──message──> iLink server
                               ▼
                 ilink-pending.json          ← pending queue (atomic writes,
                               │               survives power loss)
-                              │  worker claims with mv → ilink-processing.json
+                              │  worker: ilink.py claim → ilink-processing.json
                               ▼
                       Muse worker agent     ← pre-send queue re-check, merges
                                               bursts, sends exactly one reply;
@@ -33,8 +33,15 @@ WeChat user ──message──> iLink server
 - **No lost messages**: the hook script writes messages to disk *before*
   waking the agent. If the agent crashes or times out, the messages are
   still in the queue and the next script run wakes it again.
-- **No duplicate replies**: claiming is an atomic `mv` — of several
-  overlapping wakes, exactly one gets the queue; the rest exit quietly.
+- **No duplicate replies**: claiming goes through `ilink.py claim`
+  under a queue lock, and it refuses while a processing file exists
+  (a bare `mv` would silently replace another worker's batch) — of
+  several overlapping wakes, exactly one gets the queue; the rest exit
+  quietly. While a worker holds a fresh claim, the script does not wake
+  another one for newer messages: the holder's pre-send
+  `ilink.py claim --merge <claim_id>` folds them into the same reply,
+  and `ilink.py release <claim_id>` drops the claim afterwards (refusing
+  if the claim was recycled to someone else).
 - **Burst merging**: when a user fires off several messages, iLink splits
   them into multiple responses. The worker does not wait a fixed interval;
   it does a **pre-send re-check** — after composing a reply, right before
@@ -70,8 +77,11 @@ WeChat user ──message──> iLink server
   pending queue first, then calls `ilink.py commit`. A crash anywhere
   means the batch is simply re-fetched next round: a reply may
   duplicate, but a message is never silently lost. Supporting rules:
-  stale-claim recycling only runs while the pending queue is empty
-  (it can never overwrite a newer batch), and empty/invalid poll
+  stale-claim recycling merges the stuck batch ahead of any newer
+  pending batch (it never overwrites either one), one poll round's
+  media downloads share a budget (`ILINK_POLL_MEDIA_BUDGET`, default
+  60s) so a slow CDN delivers the item with `media_error` instead of
+  pushing the round past the poll timeout into an endless re-fetch, and empty/invalid poll
   output is treated as a poll failure (a hard crash enters the alert
   state machine instead of masquerading as "no new messages").
 

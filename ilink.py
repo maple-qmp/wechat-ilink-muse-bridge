@@ -6,8 +6,11 @@ Usage:
   ilink.py status <qrcode>     # poll scan status once (JSON)
   ilink.py login <qrcode>      # poll until confirmed (up to 300s), save token
   ilink.py bind [seconds]      # one 10-min owner-binding window (first sender wins + welcome)
-  ilink.py poll                # fetch new messages since cursor (JSON; two-phase: see commit)
+  ilink.py poll [--cursor <buf>]  # fetch new messages since cursor (JSON; two-phase: see commit)
   ilink.py commit              # commit a poll round (commit block via stdin): cursor + seen ids
+  ilink.py claim               # worker: take pending -> processing (refuses if a claim exists)
+  ilink.py claim --merge <id>  # worker: pre-send re-check, append newer pending msgs to own claim
+  ilink.py release <id>        # worker: drop processing after the reply (only if still ours)
   ilink.py send <to> <ctx> <text> [--key <id>]  # send text reply (use - for stdin)
   ilink.py proactive <to> <text> [--key <id>]   # proactive push via cached context_token
   ilink.py typing <to> <start|stop>  # show/cancel the "typing..." indicator
@@ -92,6 +95,14 @@ MEDIA_MAX_BYTES = 100 * 1024 * 1024  # media sends refuse above this size:
 # Downloads share the same cap (M3): an inbound item larger than this
 # is refused before its ciphertext can exhaust poll's memory.
 MEDIA_DIR = os.path.join(BRIDGE, "media")
+# Total seconds one poll round may spend downloading media. Must keep a
+# poll (long-poll hold <=~40s + this) inside the hook's `timeout 120`.
+try:
+    POLL_MEDIA_BUDGET = max(1.0, float(os.environ.get(
+        "ILINK_POLL_MEDIA_BUDGET", "60")))
+except ValueError:
+    POLL_MEDIA_BUDGET = 60.0
+MEDIA_BUDGET_ERROR = "download timed out (poll media budget)"
 CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
 
 # MessageItemType: TEXT=1, IMAGE=2, VOICE=3, FILE=4, VIDEO=5
@@ -155,11 +166,16 @@ def _http_get_range(url, start=0, timeout=60):
         return status, data, total, complete
 
 
-def download_media_item(item: dict, item_type: int):
+def download_media_item(item: dict, item_type: int, deadline=None):
     """Download + AES-ECB decrypt an IMAGE/VOICE/FILE/VIDEO item. Returns saved path or None.
     Diagnostics go to stderr only: poll's stdout is a machine-readable JSON
     channel, and any extra line printed there corrupts the whole batch for
-    callers (hook jq / daemon json.loads) — regression-tested."""
+    callers (hook jq / daemon json.loads) — regression-tested.
+
+    deadline (epoch seconds, optional) caps the whole download: each
+    attempt's socket timeout and back-off sleep shrink to fit, and no
+    new attempt starts once it has passed (MEDIA_ERROR:...budget). poll
+    passes its per-round media budget here — see POLL_MEDIA_BUDGET."""
     key = ITEM_KEY.get(item_type)
     if not key:
         return None
@@ -187,12 +203,25 @@ def download_media_item(item: dict, item_type: int):
     ciphertext = b""
     total = None
     last_err = "no attempt"
+    def _remaining():
+        return None if deadline is None else deadline - time.time()
+
+    def _backoff(attempt):
+        rem = _remaining()
+        delay = 2 * (attempt + 1)
+        time.sleep(delay if rem is None else max(0, min(delay, rem)))
+
     for attempt in range(4):
+        rem = _remaining()
+        if rem is not None and rem <= 0:
+            last_err = "budget exhausted"
+            break
+        timeout = 60 if rem is None else max(1, min(60, rem))
         try:
-            status, chunk, total, complete = _http_get_range(url, start=len(ciphertext), timeout=60)
+            status, chunk, total, complete = _http_get_range(url, start=len(ciphertext), timeout=timeout)
         except Exception as e:
             last_err = f"{type(e).__name__}:{str(e)[:100]}"
-            time.sleep(2 * (attempt + 1))
+            _backoff(attempt)
             continue
         if total is not None and total > MEDIA_MAX_BYTES:
             # M3: the send side refuses above MEDIA_MAX_BYTES; the
@@ -217,12 +246,18 @@ def download_media_item(item: dict, item_type: int):
             break
         if complete and ciphertext:
             break  # 无长度信息但一次读完，视为完成
-        time.sleep(2 * (attempt + 1))
+        _backoff(attempt)
     if total is not None and len(ciphertext) < total:
         print(f"MEDIA_ERROR:incomplete after retries {len(ciphertext)}/{total} last={last_err}", file=sys.stderr, flush=True)
         return None
     if not ciphertext:
         print(f"MEDIA_ERROR:empty download last={last_err}", file=sys.stderr, flush=True)
+        return None
+    if total is None and last_err != "ok":
+        # No length info and the last read was cut short (or the budget
+        # ran out mid-download): a partial ciphertext would only fail
+        # PKCS7 unpadding or, worse, decrypt to a truncated file.
+        print(f"MEDIA_ERROR:incomplete download last={last_err}", file=sys.stderr, flush=True)
         return None
     plaintext = _aes_ecb_decrypt(ciphertext, aes_key)
     ext = {2: "jpg", 3: "silk", 4: "bin", 5: "mp4"}.get(item_type, "bin")
@@ -970,6 +1005,48 @@ def save_contacts(c):
     _atomic_write(CONTACTS_FILE, lambda f: json.dump(c, f))
 
 
+@contextlib.contextmanager
+def _contacts_lock():
+    """Inter-process flock for contacts.json read-modify-write. Several
+    processes write it — poll (context_token on every inbound message),
+    typing (typing_ticket, from the worker while the hook keeps
+    polling), bind — and unlocked load -> modify -> save let one writer
+    replace the other's fresh fields: a typing call holding an old
+    snapshot could roll the owner's context_token back. Best-effort
+    like the quote cache lock: if the lock cannot be taken, proceed
+    unlocked rather than block a poll or a reply."""
+    fd = None
+    if fcntl is not None:
+        try:
+            fd = os.open(CONTACTS_FILE + ".lock", os.O_CREAT | os.O_RDWR,
+                         0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except Exception:
+            if fd is not None:
+                os.close(fd)
+            fd = None
+    try:
+        yield
+    finally:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
+def update_contacts(mutate):
+    """Locked read-modify-write of contacts.json: reload under the lock,
+    let mutate(contacts) change it in place, save. Returns the saved
+    dict. Always use this instead of a bare load_contacts() ...
+    save_contacts() pair, which can lose a concurrent writer's update."""
+    with _contacts_lock():
+        contacts = load_contacts()
+        mutate(contacts)
+        save_contacts(contacts)
+        return contacts
+
+
 # --- Quote cache ------------------------------------------------------------
 # Why this exists: when the user quotes a message, the server's ref_msg
 # carries only the quoted message's id (full quotes) or id plus a
@@ -1455,9 +1532,17 @@ def cmd_bind(wait_secs=BIND_DEFAULT_SECONDS):
                 print(f"BIND_ERROR:{e}", file=sys.stderr, flush=True)
                 time.sleep(min(2, max(0, deadline - time.time())))
                 continue
-            if data.get("code") == -14:
+            status = _api_error_code(data)
+            if status == -14:
                 print("TOKEN_EXPIRED")
                 return 2
+            if status != 0:
+                # API-level failure: nothing usable in this response
+                # (same rule as cmd_poll) — retry inside the window.
+                print(f"BIND_ERROR:api status {status}", file=sys.stderr,
+                      flush=True)
+                time.sleep(min(2, max(0, deadline - time.time())))
+                continue
             new_buf = data.get("get_updates_buf") or buf
             fresh, new_ids = filter_seen(data.get("msgs") or [])
             winner = None
@@ -1491,10 +1576,10 @@ def cmd_bind(wait_secs=BIND_DEFAULT_SECONDS):
             # window is closed to everyone else, whatever happens next.
             save_owner(winner)
             if winner_ctx:
-                contacts = load_contacts()
-                contacts[winner] = {"context_token": winner_ctx,
-                                    "updated_at": int(time.time())}
-                save_contacts(contacts)
+                def _set_winner(contacts):
+                    contacts[winner] = {"context_token": winner_ctx,
+                                        "updated_at": int(time.time())}
+                update_contacts(_set_winner)
             source_id = next(
                 (str(m.get("message_id")) for m in fresh
                  if m.get("from_user_id") == winner
@@ -1751,13 +1836,23 @@ def _report_token_status():
     return 2
 
 
-def cmd_poll():
+def cmd_poll(cursor=None):
+    """Fetch one batch (two-phase: nothing is committed here).
+
+    cursor overrides the committed cursor from session.json for this
+    one fetch (read-only: it is never saved). A driver that collects
+    several polls before committing (daemon.py's burst merge) passes
+    the previous poll's commit cursor, so each fetch continues where
+    the last one stopped instead of re-reading from the committed
+    cursor — which made the server replay the same batch instantly,
+    turning the merge window into a hot loop that re-downloaded the
+    batch's media on every round."""
     s = load_session()
     token = s.get("bot_token")
     if not token:
         print("NO_TOKEN")
         return 1
-    buf = s.get("cursor", "")
+    buf = cursor if cursor else s.get("cursor", "")
     try:
         data = api("POST", "ilink/bot/getupdates",
                    {"get_updates_buf": buf, "base_info": {"channel_version": "1.0.2"}},
@@ -1765,17 +1860,36 @@ def cmd_poll():
     except Exception as e:
         print(f"POLL_ERROR:{e}")
         return 1
-    if data.get("code") == -14:
+    status = _api_error_code(data)
+    if status == -14:
         return _report_token_status()
-    if data.get("code", 0) == 0:
-        _clear_token_stale()
+    if status != 0:
+        # An API-level failure (ret / errcode / code != 0) is a poll
+        # failure, not an empty batch: printing an empty batch with
+        # exit 0 used to look like "no new messages" to both drivers,
+        # so a persistent server-side error never reached the
+        # poll_failing alert. Nothing is fetched, nothing committed.
+        errmsg = (str(data.get("errmsg", ""))[:100]
+                  if isinstance(data, dict) else "")
+        print(f"POLL_ERROR:api status {status} {errmsg}".rstrip())
+        return 1
+    _clear_token_stale()
+    # One media budget for the whole round, started once the long-poll
+    # returned: downloads used to run up to ~260s per item, past the
+    # hook's 120s poll timeout — the round was killed before commit,
+    # the same batch came back next round and was killed again (a
+    # poison batch that stalled every later message). Items that do not
+    # fit the budget are delivered with media_error instead.
+    media_deadline = time.time() + POLL_MEDIA_BUDGET
     new_buf = data.get("get_updates_buf") or buf
     fresh, new_ids = filter_seen(data.get("msgs") or [])
     owners = load_owner_ids()
     filtered_senders = []
     msgs = []
-    contacts = load_contacts()
-    contacts_dirty = False  # L1: only write contacts when this round changed them
+    # L1: only write contacts when this round changed them. Updates are
+    # collected here and merged under the contacts lock at the end, so a
+    # concurrent writer (typing) can neither lose nor revert them.
+    ctx_updates = {}
     quote_cache = None  # L2: lazy — loaded on the first ref_msg, not every round
     pending_entries = {}
     pending_svr = {}
@@ -1825,9 +1939,8 @@ def cmd_poll():
             # typing_ticket, which a whole-entry overwrite would drop
             # on every inbound message (forcing a getconfig re-fetch
             # exactly when typing is needed most).
-            contacts.setdefault(from_id, {}).update(
-                {"context_token": ctx, "updated_at": int(time.time())})
-            contacts_dirty = True
+            ctx_updates[from_id] = {"context_token": ctx,
+                                    "updated_at": int(time.time())}
         cache_parts = []
         cache_kinds = []
         cache_media_path = None
@@ -1848,10 +1961,12 @@ def cmd_poll():
                     cache_parts.append(entry["text"])
                     cache_kinds.append("voice")
                 try:
-                    p = download_media_item(item, t)
+                    p = download_media_item(item, t, deadline=media_deadline)
                     if p:
                         entry["media_path"] = p
                         cache_media_path = p
+                    elif time.time() >= media_deadline:
+                        entry["media_error"] = MEDIA_BUDGET_ERROR
                 except Exception as e:
                     entry["media_error"] = str(e)[:100]
             elif t in (2, 4, 5):  # IMAGE / FILE / VIDEO
@@ -1860,10 +1975,12 @@ def cmd_poll():
                 cache_parts.append(_quote_media_descriptor(t, item))
                 cache_kinds.append(ITEM_TYPE_NAMES.get(t, "text"))
                 try:
-                    p = download_media_item(item, t)
+                    p = download_media_item(item, t, deadline=media_deadline)
                     if p:
                         entry["media_path"] = p
                         cache_media_path = p
+                    elif time.time() >= media_deadline:
+                        entry["media_error"] = MEDIA_BUDGET_ERROR
                     else:
                         entry["media_error"] = "download failed"
                 except Exception as e:
@@ -1909,8 +2026,14 @@ def cmd_poll():
             pending_entries[str(m["message_id"])] = cache_entry
     if pending_entries or pending_svr:
         _quote_cache_upsert(pending_entries, pending_svr)
-    if contacts_dirty:
-        save_contacts(contacts)
+    if ctx_updates:
+        def _merge(contacts):
+            for uid, fields in ctx_updates.items():
+                ent = contacts.get(uid)
+                if not isinstance(ent, dict):
+                    ent = contacts[uid] = {}
+                ent.update(fields)
+        update_contacts(_merge)
     # Two-phase commit: do NOT advance the cursor or record seen ids
     # here. The caller (hook script / daemon) queues the batch durably,
     # then submits the commit block below via `ilink.py commit`. A crash
@@ -1960,6 +2083,144 @@ def cmd_commit():
         save_session(s)
     print("COMMIT_OK")
     return 0
+
+
+# --- Worker queue claim (hook driver) ----------------------------------------
+# The hook lands each batch in <state>/ilink-pending.json; a worker takes
+# it over as <state>/ilink-processing.json. The original protocol was a
+# bare `mv pending processing`, which has two holes:
+#   * mv silently REPLACES an existing processing file, so a second
+#     worker (woken while the first was still composing) destroyed the
+#     first worker's claim — crash recovery could no longer find that
+#     batch, and the first worker's cleanup could delete the second's.
+#   * nothing tied a claim to its worker: a slow worker whose claim was
+#     recycled could still delete (or reply to) the batch now owned by
+#     someone else.
+# These commands replace the bare mv. All three run under one flock
+# (<state>/ilink-queue.lock), which the hook also takes for stale
+# recycling, so a claim, a merge and a recycle never interleave:
+#   claim              pending -> processing, only if NO processing file
+#                      exists (exit 3 CLAIM_BUSY otherwise: the holder
+#                      merges newer messages itself). Stamps a claim_id.
+#   claim --merge ID   pre-send re-check: append pending's messages to
+#                      the caller's processing file (exit 3
+#                      MERGE_NOT_OWNER when the claim was recycled —
+#                      the caller must then NOT send).
+#   release ID         delete processing, only if it still carries ID.
+# ID is optional for backward compatibility (no ownership check then).
+QUEUE_LOCK_NAME = "ilink-queue.lock"
+
+
+@contextlib.contextmanager
+def _queue_lock(state_dir):
+    """flock on <state>/ilink-queue.lock (shared with the hook script's
+    `flock` on the same file). No-op where fcntl is unavailable."""
+    fd = None
+    if fcntl is not None:
+        os.makedirs(state_dir, exist_ok=True)
+        fd = os.open(os.path.join(state_dir, QUEUE_LOCK_NAME),
+                     os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        yield
+    finally:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
+def _read_queue_file(path):
+    """The queue object at path, or None when the file is missing or
+    empty. Raises ValueError on a corrupt / misshapen queue (same strict
+    shape rule as the hook: object with a .msgs array)."""
+    try:
+        with open(path) as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return None
+    if not raw.strip():
+        return None
+    data = json.loads(raw)
+    if not isinstance(data, dict) or not isinstance(data.get("msgs"), list):
+        raise ValueError(f"misshapen queue file {path}")
+    return data
+
+
+def cmd_claim(merge=False, claim_id=None):
+    """Claim or merge the pending batch (see the block comment above).
+    Exit 0 on CLAIMED / MERGED / MERGE_NOTHING, 3 when there is nothing
+    for this caller (CLAIM_BUSY, CLAIM_EMPTY, MERGE_NOT_OWNER), 1 on a
+    corrupt queue file (left in place for the hook to quarantine)."""
+    state_dir = _hook_state_dir()
+    pend = os.path.join(state_dir, "ilink-pending.json")
+    proc = os.path.join(state_dir, "ilink-processing.json")
+    try:
+        with _queue_lock(state_dir):
+            if merge:
+                cur = _read_queue_file(proc)
+                if cur is None or (claim_id and cur.get("claim_id") != claim_id):
+                    # The claim was recycled (stale) or released: its
+                    # batch belongs to someone else now. Do not send.
+                    print("MERGE_NOT_OWNER")
+                    return 3
+                new = _read_queue_file(pend)
+                if not new or not new["msgs"]:
+                    os.utime(proc)  # doubles as a lease renewal
+                    print("MERGE_NOTHING")
+                    return 0
+                cur["msgs"] = cur["msgs"] + new["msgs"]
+                _atomic_write(proc, lambda f: json.dump(cur, f,
+                                                        ensure_ascii=False))
+                os.remove(pend)
+                print(f"MERGED:{len(new['msgs'])}:{len(cur['msgs'])}")
+                return 0
+            if os.path.exists(proc):
+                age = int(time.time() - os.stat(proc).st_ctime)
+                print(f"CLAIM_BUSY:{age}")
+                return 3
+            new = _read_queue_file(pend)
+            if not new or not new["msgs"]:
+                print("CLAIM_EMPTY")
+                return 3
+            new["claim_id"] = (f"{os.getpid()}-"
+                               f"{random.randint(0, 0xFFFFFFFF):08x}")
+            # Write the stamped copy, then drop pending: both under
+            # the queue lock, so no claim or recycle can interleave.
+            _atomic_write(proc, lambda f: json.dump(new, f,
+                                                    ensure_ascii=False))
+            os.remove(pend)
+            print(f"CLAIMED:{new['claim_id']}:{len(new['msgs'])}")
+            print(f"PROCESSING_FILE:{proc}")
+            return 0
+    except ValueError as e:
+        print(f"QUEUE_CORRUPT:{e}")
+        return 1
+
+
+def cmd_release(claim_id=None):
+    """Delete the processing file after the reply went out — only when
+    it still carries claim_id (a recycled-and-reclaimed batch belongs to
+    another worker and must survive). Exit 0 RELEASED / RELEASE_NOTHING,
+    3 RELEASE_NOT_OWNER."""
+    state_dir = _hook_state_dir()
+    proc = os.path.join(state_dir, "ilink-processing.json")
+    with _queue_lock(state_dir):
+        if not os.path.exists(proc):
+            print("RELEASE_NOTHING")
+            return 0
+        if claim_id:
+            try:
+                cur = _read_queue_file(proc) or {}
+            except ValueError:
+                cur = {}
+            if cur.get("claim_id") != claim_id:
+                print("RELEASE_NOT_OWNER")
+                return 3
+        os.remove(proc)
+        print("RELEASED")
+        return 0
 
 
 def _send_raw(to_user_id, context_token, text, token, client_id=None):
@@ -2250,9 +2511,43 @@ def _mark_send_ledger_sent(key, client_id):
     _write_send_ledger(book)
 
 
+def _api_error_code(data):
+    """The status of an iLink API response, as one int: 0 on success.
+
+    The server reports failure through any of three fields — `code`,
+    `ret` and `errcode` — and a response can carry `code: 0` next to
+    a non-zero `ret` (e.g. `{"code": 0, "ret": -2}`, the stale
+    context_token signature). Reading `code` alone used to report such
+    a response as a success: a keyed send flipped its ledger entry to
+    'sent' for a message that never went out, so every retry got
+    SEND_ALREADY_SENT and the reply was lost for good. Rule: -14 in
+    any field wins (token expiry); otherwise the first non-zero field
+    in code / ret / errcode order; a non-integer status value counts
+    as a failure (-1); a non-dict response is a failure (-1)."""
+    if not isinstance(data, dict):
+        return -1
+    codes = []
+    for field in ("code", "ret", "errcode"):
+        value = data.get(field)
+        if value is None or value == "":
+            continue
+        try:
+            codes.append(int(value))
+        except (TypeError, ValueError):
+            codes.append(-1)
+    if -14 in codes:
+        return -14
+    for c in codes:
+        if c != 0:
+            return c
+    return 0
+
+
 def _classify_send_response(data, require_message_id=False):
     """Shared send/proactive outcome rule: 'ok' | 'token_expired' | 'app_error'.
-    code -14 is always token expiry; code != 0 is an application failure.
+    Status comes from _api_error_code (code / ret / errcode, not just
+    code): -14 is always token expiry; any other non-zero status is an
+    application failure.
     When require_message_id is set (media sends), a code-0 response with
     no message_id is also an application failure, not a success.
     Contract note (S5, deliberately NOT enforced): text sends accept
@@ -2262,7 +2557,7 @@ def _classify_send_response(data, require_message_id=False):
     server-contract surprise (currently accepted, not failed); aligning
     text with media here would change success semantics and is left
     for a separate decision."""
-    code = data.get("code", 0)
+    code = _api_error_code(data)
     if code == -14:
         return "token_expired"
     if code != 0:
@@ -2366,13 +2661,16 @@ def cmd_proactive(to_user_id, text, key=None):
                         error=type(e).__name__, attempt=2)
             print(f"SEND_ERROR:{e}")
             return 1
+        # Same outcome rule as attempt 1: a second {"ret": -2} is a
+        # failure, not PROACTIVE_OK (it used to be judged by `code`
+        # alone and report success for an undelivered push).
+        outcome = _classify_send_response(data)
         _audit_send("proactive", to_user_id, client_id,
-                    "ok" if data.get("code", 0) == 0 else "app_error",
+                    "ok" if outcome == "ok" else "app_error",
                     elapsed_ms=int((time.time() - t0) * 1000), attempt=2)
-        code = data.get("code", 0)
-        if code == -14:
+        if outcome == "token_expired":
             return _report_token_status()
-        if code != 0:
+        if outcome != "ok":
             print(f"PROACTIVE_FAILED:{str(data)[:200]}")
             return 1
     if key:
@@ -2517,10 +2815,16 @@ def _typing_ticket(to_user_id, token, force=False):
                token=token, timeout=20)
     ticket = data.get("typing_ticket")
     if ticket:
-        entry["typing_ticket"] = ticket
-        entry["typing_ticket_at"] = now
-        contacts[to_user_id] = entry
-        save_contacts(contacts)
+        # Reload under the lock and touch only the ticket fields: the
+        # snapshot above is stale by a network round-trip, and saving it
+        # whole could revert a context_token poll wrote meanwhile.
+        def _set_ticket(contacts):
+            ent = contacts.get(to_user_id)
+            if not isinstance(ent, dict):
+                ent = contacts[to_user_id] = {}
+            ent["typing_ticket"] = ticket
+            ent["typing_ticket_at"] = now
+        update_contacts(_set_ticket)
     return ticket
 
 
@@ -2546,7 +2850,7 @@ def cmd_typing(to_user_id, status_word):
                     "status": status,
                     "base_info": {"channel_version": "1.0.2"}},
                    token=token, timeout=20)
-        if data.get("ret", 0) != 0:
+        if _api_error_code(data) != 0:
             # ticket 可能已失效，强制刷新后重试一次；刷新仍无票据时
             # 直接报错，不要发一次必然失败的请求。
             ticket = _typing_ticket(to_user_id, token, force=True)
@@ -2558,7 +2862,7 @@ def cmd_typing(to_user_id, status_word):
                         "status": status,
                         "base_info": {"channel_version": "1.0.2"}},
                        token=token, timeout=20)
-            if data.get("ret", 0) != 0:
+            if _api_error_code(data) != 0:
                 print(f"TYPING_FAILED:{str(data)[:200]}")
                 return 1
     except Exception as e:
@@ -2820,12 +3124,16 @@ def cmd_proactive_media(to_user_id, path, media_type, playtime_ms=0, key=None):
         print(f"SEND_ERROR:{e}")
         return 1
     outcome = _classify_send_response(data_resp, require_message_id=True)
+    retry = _proactive_needs_tokenless_retry(data_resp,
+                                             require_message_id=True)
     _audit_send("media", to_user_id, client_id,
-                "ok" if outcome == "ok" else "app_error",
+                "app_error" if retry else "ok",
                 elapsed_ms=int((time.time() - t0) * 1000), attempt=1)
     if outcome == "token_expired":
         return _report_token_status()
-    if outcome != "ok":
+    if retry:
+        # Same tokenless-retry trigger as text proactive (including
+        # the 'prepare failed' signature), so the two push paths agree.
         try:
             t0 = time.time()
             data_resp = _send_item_raw(to_user_id, None, item, token,
@@ -2935,7 +3243,7 @@ def cmd_health(offline=False):
                            token=token, timeout=12)
                 if data.get("typing_ticket"):
                     lines.append("probe: token valid (getconfig OK)")
-                elif data.get("code") == -14:
+                elif _api_error_code(data) == -14:
                     problems.append("token expired (getconfig code -14), re-scan needed")
                 else:
                     warnings.append(f"probe result unclear: {str(data)[:80]}")
@@ -3100,7 +3408,7 @@ def cmd_smoke_test(no_send=False, to_user_id=None):
             else:
                 if data.get("typing_ticket"):
                     _check("login", "PASS", "getconfig OK")
-                elif data.get("code") == -14:
+                elif _api_error_code(data) == -14:
                     _check("login", "FAIL", "token expired (getconfig code -14)")
                 else:
                     _check("login", "FAIL", f"probe unclear: {str(data)[:80]}")
@@ -3591,9 +3899,25 @@ def main(argv):
             secs = BIND_DEFAULT_SECONDS
         return cmd_bind(secs)
     if cmd == "poll":
-        return cmd_poll()
+        args = argv[2:]
+        cursor = None
+        if "--cursor" in args:
+            i = args.index("--cursor")
+            if i + 1 >= len(args):
+                print("usage: ilink.py poll [--cursor <buf>]", file=sys.stderr)
+                return 2
+            cursor = args[i + 1]
+        return cmd_poll(cursor)
     if cmd == "commit":
         return cmd_commit()
+    if cmd == "claim":
+        args = argv[2:]
+        if args and args[0] == "--merge":
+            return cmd_claim(merge=True,
+                             claim_id=args[1] if len(args) > 1 else None)
+        return cmd_claim()
+    if cmd == "release":
+        return cmd_release(argv[2] if len(argv) > 2 else None)
     if cmd == "health":
         return cmd_health(offline="--offline" in argv)
     if cmd == "smoke-test":

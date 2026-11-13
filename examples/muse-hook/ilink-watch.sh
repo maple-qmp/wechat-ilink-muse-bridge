@@ -158,6 +158,25 @@ warm_alive() {
   [ $((NOW - hb)) -le 45 ] && [ "$until_n" -gt "$NOW" ]
 }
 
+# 队列锁：与 `ilink.py claim / claim --merge / release` 共用
+# $STATE_DIR/ilink-queue.lock（同一把 flock），保证"认领 / 合并 / 超时回收 /
+# 落盘新批次"互不交叠。fd 7 只在需要时短暂持有。
+QUEUE_LOCK=$STATE_DIR/ilink-queue.lock
+queue_lock() { exec 7>"$QUEUE_LOCK"; flock -w 30 7; }
+queue_unlock() { flock -u 7 2>/dev/null || true; exec 7>&-; }
+
+# processing 认领是否已超时（ctime 超 10 分钟 = worker 停止续租，视为已死）
+proc_stale() {
+  [ -f "$PROC" ] && [ -n "$(find "$PROC" -cmin +10 2>/dev/null || true)" ]
+}
+# 有一个仍在续租的 worker 正在处理：新批次留给它在发送前复查时合并
+# （或回复后由 warm-wait 接手），不再另起 worker。以前这里照样 wake，
+# 第二个 worker 的 mv 会直接覆盖第一个的 processing 文件——双回复，
+# 且第一个批次从崩溃恢复里消失。
+claim_fresh() {
+  [ -f "$PROC" ] && ! proc_stale
+}
+
 # 告警状态读写（jq，原子写；dry-run 不写状态，保持纯净）
 astate() { jq -r ".$1 // 0" "$ALERT" 2>/dev/null || echo 0; }
 aset() {
@@ -185,21 +204,45 @@ if [ "$vc_last" -eq 0 ] || [ $((NOW - vc_last)) -ge 3600 ]; then
 fi
 
 # 崩溃恢复：上一个 worker 超过 10 分钟没处理完，把消息退回 pending
-# 崩溃恢复：上一个 worker 超过 10 分钟没处理完，把消息退回 pending
 # 注意：必须用 -cmin（inode 变更时间）而非 -mmin（内容修改时间）：
 # worker 用 mv 认领队列时 mtime 保留为消息落盘时间，若消息在 pending 里
 # 积压超过 10 分钟，认领瞬间就会被误判过期、打回 pending 形成乒乓循环。
 # mv 会刷新 ctime，ctime 才是真正的“被认领时间”。
-# 待处理队列里还有批次时不回收：先处理排队中的（它更新），卡住的下一轮再说。
-# 否则 mv 会覆盖掉尚未处理的新批次——覆盖即永久丢失。
+# pending 里还有新批次时，把卡住的批次合并到它前面（旧消息在前），
+# 绝不覆盖新批次。以前遇到这种情况只是推迟回收，而 worker 认领新批次
+# 的 mv 会覆盖卡住的 processing 文件，卡住的批次就永久丢了。
+# 全程持有队列锁，与 ilink.py claim/merge/release 互斥。
 pending_msgs=$(queue_count "$PENDING")
-if [ -f "$PROC" ] && [ "${pending_msgs:-0}" -eq 0 ] && [ -n "$(find "$PROC" -cmin +10 2>/dev/null || true)" ]; then
-  mv "$PROC" "$PENDING"
-  log "recovered stale processing file to pending"
-  # 卡住计时：能被回收说明这一轮处理至少已卡了 10 分钟，起点回拨 600 秒
-  if [ "$(astate stuck_since)" -eq 0 ]; then
-    aset stuck_since $((NOW - 600))
+if proc_stale && queue_lock; then
+  if proc_stale; then
+    if [ "${pending_msgs:-0}" -gt 0 ] 2>/dev/null; then
+      mtmp="$PENDING.tmp.$$"
+      if jq -c -s '{msgs: ((.[0].msgs // []) + (.[1].msgs // []))}' "$PROC" "$PENDING" > "$mtmp" 2>/dev/null; then
+        mv "$mtmp" "$PENDING"
+        rm -f "$PROC"
+        log "recovered stale processing file, merged ahead of pending"
+      else
+        rm -f "$mtmp"
+        log_line "RECOVER_MERGE_FAILED: $PROC could not be merged into $PENDING; left in place"
+      fi
+    else
+      # claim_id 只属于原认领者，退回 pending 时去掉
+      mtmp="$PENDING.tmp.$$"
+      if jq -c '{msgs: (.msgs // [])}' "$PROC" > "$mtmp" 2>/dev/null; then
+        mv "$mtmp" "$PENDING"
+        rm -f "$PROC"
+      else
+        rm -f "$mtmp"
+        mv "$PROC" "$PENDING"
+      fi
+      log "recovered stale processing file to pending"
+    fi
+    # 卡住计时：能被回收说明这一轮处理至少已卡了 10 分钟，起点回拨 600 秒
+    if [ "$(astate stuck_since)" -eq 0 ]; then
+      aset stuck_since $((NOW - 600))
+    fi
   fi
+  queue_unlock
 fi
 
 # 有未处理的消息（上一轮拉到、agent 还没吃完）：直接 wake，不再拉新的
@@ -225,6 +268,9 @@ if [ -s "$PENDING" ]; then
     if warm_alive; then
       log "warm worker on duty, $cnt pending left to it"
       silent "warm worker on duty"
+    elif claim_fresh; then
+      log "active claim in processing, $cnt pending left to its pre-send merge"
+      silent "worker on duty (fresh claim)"
     else
       wake "pending_wechat_messages" "{\"count\":$cnt,\"pending_file\":\"$PENDING\"$extra}"
     fi
@@ -344,7 +390,17 @@ else
         # 原子写入 pending（只写 msgs，保持队列文件既有格式）
         tmp="$PENDING.tmp.$$"
         printf '%s' "$out" | jq -c '{msgs}' > "$tmp"
-        mv "$tmp" "$PENDING"
+        # 落盘在队列锁内进行；万一 pending 已存在（理论上本分支只在
+        # pending 为空时进入），合并追加而不是覆盖。
+        if queue_lock; then
+          if [ -s "$PENDING" ] && jq -e '.msgs | type == "array"' "$PENDING" >/dev/null 2>&1; then
+            jq -c -s '{msgs: (.[0].msgs + .[1].msgs)}' "$PENDING" "$tmp" > "$tmp.m" && mv "$tmp.m" "$tmp"
+          fi
+          mv "$tmp" "$PENDING"
+          queue_unlock
+        else
+          mv "$tmp" "$PENDING"
+        fi
         log "received $cnt messages"
         # Light the "typing..." indicator the moment the batch lands (owner
         # only) instead of waiting for the worker agent to boot — the worker's
@@ -362,6 +418,12 @@ else
           # 免得恢复通知被吞掉（双 worker 靠 mv 原子认领仲裁，不重复处理）
           log "warm worker on duty, batch left to it"
           silent "warm worker on duty"
+        elif [ -z "$recovered" ] && claim_fresh; then
+          # 已有 worker 在处理：它发送前的复查（claim --merge）会把这批
+          # 合并进同一条回复；它回复后若没合并到，warm-wait 会接手，
+          # 或它 release 后下一轮再 wake。
+          log "active claim in processing, batch left to its pre-send merge"
+          silent "worker on duty (fresh claim)"
         else
           wake "new_wechat_messages" "{\"count\":$cnt,\"pending_file\":\"$PENDING\"$rec_extra}"
         fi

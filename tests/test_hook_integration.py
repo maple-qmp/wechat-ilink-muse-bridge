@@ -182,9 +182,63 @@ class HookIntegrationTest(unittest.TestCase):
         pend_path = os.path.join(self.state, "ilink-pending.json")
         with open(pend_path, "w") as f:
             json.dump({"msgs": [{"message_id": 2}]}, f)
-        self.run_hook(EMPTY)
-        self.assertEqual(self.pending(), {"msgs": [{"message_id": 2}]})
-        self.assertTrue(os.path.exists(proc))  # deferred, not moved
+        calls = self.run_hook(EMPTY)
+        # 2026-11-13: the stale batch is merged AHEAD of the newer one
+        # (oldest first) instead of being deferred. Deferring left the
+        # stale file where the next worker's claim would overwrite it.
+        self.assertEqual(self.pending(),
+                         {"msgs": [{"message_id": 1}, {"message_id": 2}]})
+        self.assertFalse(os.path.exists(proc))
+        self.assertIn("WAKE pending_wechat_messages", calls)
+
+    def test_stale_recycle_drops_claim_id(self):
+        proc = os.path.join(self.state, "ilink-processing.json")
+        with open(proc, "w") as f:
+            json.dump({"msgs": [{"message_id": 1}], "claim_id": "dead-1"}, f)
+        subprocess.run(["touch", "-d", "15 minutes ago", proc], check=True)
+        self.run_hook()
+        self.assertEqual(self.pending(), {"msgs": [{"message_id": 1}]})
+        self.assertFalse(os.path.exists(proc))
+
+    def write_proc(self, age_minutes=0):
+        proc = os.path.join(self.state, "ilink-processing.json")
+        with open(proc, "w") as f:
+            json.dump({"msgs": [{"from_user_id": "owner1",
+                                 "message_id": 30}], "claim_id": "w-1"}, f)
+        if age_minutes:
+            subprocess.run(["touch", "-d", f"{age_minutes} minutes ago",
+                            proc], check=True)
+        return proc
+
+    def test_fresh_claim_suppresses_pending_wake(self):
+        # A worker holds a fresh claim: a newer pending batch is left to
+        # its pre-send merge. Waking a second worker used to let that
+        # worker's `mv` overwrite the first worker's processing file.
+        proc = self.write_proc()
+        with open(os.path.join(self.state, "ilink-pending.json"), "w") as f:
+            json.dump({"msgs": [{"from_user_id": "owner1",
+                                 "message_id": 31}]}, f)
+        calls = self.run_hook()
+        self.assertNotIn("WAKE", calls)
+        self.assertIn("worker on duty (fresh claim)", calls)
+        self.assertTrue(os.path.exists(proc))
+
+    def test_fresh_claim_suppresses_new_batch_wake(self):
+        self.write_proc()
+        calls = self.run_hook(BATCH)
+        self.assertEqual(self.pending(), {"msgs": json.loads(BATCH)["msgs"]})
+        self.assertIn('COMMIT {"cursor":"B2","ids":["7"]} ORDER_OK', calls)
+        self.assertNotIn("WAKE", calls)
+
+    def test_stale_claim_does_not_suppress_wake(self):
+        self.write_proc(age_minutes=15)
+        with open(os.path.join(self.state, "ilink-pending.json"), "w") as f:
+            json.dump({"msgs": [{"from_user_id": "owner1",
+                                 "message_id": 31}]}, f)
+        calls = self.run_hook()
+        self.assertIn("WAKE pending_wechat_messages", calls)
+        self.assertEqual([m["message_id"] for m in self.pending()["msgs"]],
+                         [30, 31])
 
     def test_crash_output_is_a_poll_failure(self):
         self.run_hook("")

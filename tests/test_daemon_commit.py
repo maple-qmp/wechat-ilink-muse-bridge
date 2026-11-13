@@ -331,7 +331,7 @@ class CollectBurstDedupeTest(unittest.TestCase):
     def _scripted_poll(self, script):
         it = iter(script)
 
-        def fake():
+        def fake(cursor=None):
             return next(it)
         return fake
 
@@ -397,7 +397,7 @@ class CollectBurstDedupeTest(unittest.TestCase):
         replay = {"from_user_id": "u1", "message_id": "a",
                   "context_token": "ctx-1", "text": "hello", "kind": "text"}
 
-        def fake_poll():
+        def fake_poll(cursor=None):
             calls.append(1)
             return "ok", [dict(replay)], None
 
